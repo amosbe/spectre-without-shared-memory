@@ -482,16 +482,6 @@ void scanRawSetForSpecificX(size_t chosen_x, uint8_t chosen_value, char swap){
 
 int main(int argc, const char **argv)
 {
-	uint64_t k,kk;
-	k = rdtscp64();
-	while(1){
-		clflush(&l3);
-		kk = rdtscp64()-k;
-		printf("%lu\n",kk);
-		k = rdtscp64();
-		memaccess(&l3);
-	}
-
 	delayloop(3000000000U);
 	l3 = l3_prepare(NULL);
 	nsets = l3_getSets(l3);
