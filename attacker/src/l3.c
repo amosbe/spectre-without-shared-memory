@@ -42,9 +42,10 @@
 //#define DEBUG 1
 
 #define MANUAL
+
 #define MANUAL_ASSOCIATIVITY 	12
-#define MANUAL_SLICES			4
-#define MANUAL_BUFFSIZE 		(MANUAL_ASSOCIATIVITY*1024*1024)
+#define MANUAL_SLICES		4
+#define MANUAL_BUFFSIZE 	(MANUAL_ASSOCIATIVITY*1024*1024)
 
 /*
  * Intel documentation still mentiones one slice per core, but
@@ -63,7 +64,7 @@
  * the slice size we can get rid of this mess.
  */
 #define L3_SETS_PER_SLICE 2048
-#define L3_GROUPSIZE_FOR_HUGEPAGES L3_SETS_PER_SLICE
+#define L3_GROUPSIZE_FOR_HUGEPAGES 2048
 
 // The number of cache sets in each page
 #define L3_SETS_PER_PAGE 64
@@ -770,6 +771,51 @@ int l3_repeatedprobecount_with_indicator(l3pp_t l3, int nrecords, uint16_t *resu
 	return oos;
 }
 
+int l3_repeatedprobecount_with_indicator_and_times(l3pp_t l3, int nrecords, uint16_t *results,  uint64_t *results_times,int *results_indicator, int slot, volatile int* indicator) {
+	exit(0);
+	assert(l3 != NULL);
+	assert(results != NULL);
+
+	if (nrecords == 0)
+		return 0;
+
+	int len = l3->nmonitored;
+	int oos = 0;
+	int even = 1;
+	int missed = 0;
+	uint64_t prev_time = rdtscp64();
+	uint64_t _time;
+	int _indicator;
+	for (int i = 0; i < nrecords; i++, results += len) {
+		if (missed) {
+			oos ++;
+			for (int j = 0; j < len; j++)
+				results[j] = -1;
+		} else {
+			_indicator = *indicator;
+			_time = rdtscp64();
+			if (even)
+				l3_probecount(l3, results);
+			else
+				l3_bprobecount(l3, results);
+
+			int idx = i*len;
+
+			for(int j=idx; j<idx + len;j++){
+				results_indicator[j] = _indicator;
+				results_times[j] = _time;
+			}
+
+			even = !even;
+		}
+		if (slot > 0) {
+			prev_time += slot;
+			missed = slotwait(prev_time);
+		}
+	}
+	return oos;
+}
+
 
 int l3_probecount_set(l3pp_t l3,int set){
 	return probecount(l3->monitoredhead[set]);
@@ -792,3 +838,9 @@ void l3_swapslices(l3pp_t l3, int sliceA, int sliceB){
 	memcpy(&(l3->groups[sliceB]),&tmp,sizeof(vlist_t));
 }
 
+//void l3_sethead(l3pp_t l3){
+//	int nsets = l3_getSets(l3);
+//	for (int i = 0; i < nsets; i++){
+//		sethead(l3,i);
+//	}
+//}
