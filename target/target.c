@@ -91,7 +91,7 @@ void info(){
 uint8_t victim_function(size_t x)
 {
 	if (x < array1_size) {
-		memaccess(&array2[array1[x] * 64]);//MAGIC_BYTE;
+		memaccess(&array2[array1[x] * 256]);//MAGIC_BYTE;
 		return 0;
 	}
 	return 1;
