@@ -118,7 +118,7 @@ int main(int argc, const char **argv){
 	info();
 #endif
 
-	for (size_t i = 0; i < sizeof(array2); i++)
+	for (size_t i = 0; i < bufsize; i++)
 		array2[i] = 1; /* write to array2 so in RAM not copy-on-write zero pages */
 
 	//Create socket
